@@ -13,7 +13,6 @@ import (
 	"github.com/ava-labs/avalanchego/database/prefixdb"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
-	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/formatting"
 	"github.com/ava-labs/avalanchego/utils/hashing"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
@@ -27,9 +26,11 @@ import (
 
 // TODO: Cache prefixed IDs or use different way of keying into database
 const (
-	startDBPrefix  = "start"
-	stopDBPrefix   = "stop"
-	uptimeDBPrefix = "uptime"
+	startDBPrefix           = "start"
+	stopDBPrefix            = "stop"
+	uptimeDBPrefix          = "uptime"
+	currentValidatorsPrefix = "currentVdrs"
+	pendingValidatorsPrefix = "pendingVdrs"
 )
 
 var (
@@ -76,6 +77,7 @@ func (vm *VM) enqueueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	var (
 		staker   TimedTx
 		priority byte
+		nodeID   ids.ShortID
 	)
 	switch unsignedTx := stakerTx.UnsignedTx.(type) {
 	case *UnsignedAddDelegatorTx:
@@ -84,9 +86,11 @@ func (vm *VM) enqueueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	case *UnsignedAddSubnetValidatorTx:
 		staker = unsignedTx
 		priority = 0
+		nodeID = unsignedTx.Validator.NodeID
 	case *UnsignedAddValidatorTx:
 		staker = unsignedTx
 		priority = 2
+		nodeID = unsignedTx.Validator.NodeID
 	default:
 		return fmt.Errorf("staker is unexpected type %T", stakerTx)
 	}
@@ -97,23 +101,31 @@ func (vm *VM) enqueueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	prefixStart := []byte(fmt.Sprintf("%s%s", subnetID, startDBPrefix))
 	prefixStartDB := prefixdb.NewNested(prefixStart, db)
 
-	p := wrappers.Packer{MaxSize: wrappers.LongLen + wrappers.ByteLen + hashing.HashLen}
-	p.PackLong(uint64(staker.StartTime().Unix()))
-	p.PackByte(priority)
-	p.PackFixedBytes(stakerID[:])
-	if p.Err != nil {
+	startKey, err := timedTxKey(staker.StartTime(), priority, stakerID)
+	if err != nil {
 		// Close the DB, but ignore the error, as the parent error needs to be
 		// returned.
 		_ = prefixStartDB.Close()
-		return fmt.Errorf("couldn't serialize validator key: %w", p.Err)
+		return err
 	}
-	startKey := p.Bytes
 
 	errs := wrappers.Errs{}
 	errs.Add(
 		prefixStartDB.Put(startKey, txBytes),
 		prefixStartDB.Close(),
 	)
+
+	// If the staker being added is a validator, add it to the pending validators index
+	if priority != 1 {
+		prefixPendingValidators := []byte(fmt.Sprintf("%s%s", subnetID, pendingValidatorsPrefix))
+		pendingValidatorsDB := prefixdb.NewNested(prefixPendingValidators, db)
+
+		errs.Add(
+			pendingValidatorsDB.Put(nodeID.Bytes(), txBytes),
+			pendingValidatorsDB.Close(),
+		)
+	}
+
 	return errs.Err
 }
 
@@ -123,6 +135,7 @@ func (vm *VM) dequeueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	var (
 		staker   TimedTx
 		priority byte
+		nodeID   ids.ShortID
 	)
 	switch unsignedTx := stakerTx.UnsignedTx.(type) {
 	case *UnsignedAddDelegatorTx:
@@ -131,9 +144,11 @@ func (vm *VM) dequeueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	case *UnsignedAddSubnetValidatorTx:
 		staker = unsignedTx
 		priority = 0
+		nodeID = unsignedTx.Validator.NodeID
 	case *UnsignedAddValidatorTx:
 		staker = unsignedTx
 		priority = 2
+		nodeID = unsignedTx.Validator.NodeID
 	default:
 		return fmt.Errorf("staker is unexpected type %T", stakerTx)
 	}
@@ -143,23 +158,30 @@ func (vm *VM) dequeueStaker(db database.Database, subnetID ids.ID, stakerTx *Tx)
 	prefixStart := []byte(fmt.Sprintf("%s%s", subnetID, startDBPrefix))
 	prefixStartDB := prefixdb.NewNested(prefixStart, db)
 
-	p := wrappers.Packer{MaxSize: wrappers.LongLen + wrappers.ByteLen + hashing.HashLen}
-	p.PackLong(uint64(staker.StartTime().Unix()))
-	p.PackByte(priority)
-	p.PackFixedBytes(stakerID[:])
-	if p.Err != nil {
+	startKey, err := timedTxKey(staker.StartTime(), priority, stakerID)
+	if err != nil {
 		// Close the DB, but ignore the error, as the parent error needs to be
 		// returned.
 		_ = prefixStartDB.Close()
-		return fmt.Errorf("couldn't serialize validator key: %w", p.Err)
+		return fmt.Errorf("couldn't serialize validator key: %w", err)
 	}
-	startKey := p.Bytes
 
 	errs := wrappers.Errs{}
 	errs.Add(
 		prefixStartDB.Delete(startKey),
 		prefixStartDB.Close(),
 	)
+
+	// If the staker being removed is a validator, remove it from the pending validators index
+	if priority != 1 {
+		prefixPendingValidators := []byte(fmt.Sprintf("%s%s", subnetID, pendingValidatorsPrefix))
+		pendingValidatorsDB := prefixdb.NewNested(prefixPendingValidators, db)
+
+		errs.Add(
+			pendingValidatorsDB.Delete(nodeID.Bytes()),
+			pendingValidatorsDB.Close(),
+		)
+	}
 	return errs.Err
 }
 
@@ -169,6 +191,7 @@ func (vm *VM) addStaker(db database.Database, subnetID ids.ID, tx *rewardTx) err
 	var (
 		staker   TimedTx
 		priority byte
+		nodeID   ids.ShortID
 	)
 	switch unsignedTx := tx.Tx.UnsignedTx.(type) {
 	case *UnsignedAddDelegatorTx:
@@ -177,9 +200,11 @@ func (vm *VM) addStaker(db database.Database, subnetID ids.ID, tx *rewardTx) err
 	case *UnsignedAddSubnetValidatorTx:
 		staker = unsignedTx
 		priority = 1
+		nodeID = unsignedTx.Validator.NodeID
 	case *UnsignedAddValidatorTx:
 		staker = unsignedTx
 		priority = 2
+		nodeID = unsignedTx.Validator.NodeID
 	default:
 		return fmt.Errorf("staker is unexpected type %T", tx.Tx.UnsignedTx)
 	}
@@ -195,23 +220,31 @@ func (vm *VM) addStaker(db database.Database, subnetID ids.ID, tx *rewardTx) err
 	prefixStop := []byte(fmt.Sprintf("%s%s", subnetID, stopDBPrefix))
 	prefixStopDB := prefixdb.NewNested(prefixStop, db)
 
-	p := wrappers.Packer{MaxSize: wrappers.LongLen + wrappers.ByteLen + hashing.HashLen}
-	p.PackLong(uint64(staker.EndTime().Unix()))
-	p.PackByte(priority)
-	p.PackFixedBytes(txID[:])
-	if p.Err != nil {
+	stopKey, err := timedTxKey(staker.EndTime(), priority, txID)
+	if err != nil {
 		// Close the DB, but ignore the error, as the parent error needs to be
 		// returned.
 		_ = prefixStopDB.Close()
-		return fmt.Errorf("couldn't serialize validator key: %w", p.Err)
+		return fmt.Errorf("couldn't serialize validator key: %w", err)
 	}
-	stopKey := p.Bytes
 
 	errs := wrappers.Errs{}
 	errs.Add(
 		prefixStopDB.Put(stopKey, txBytes),
 		prefixStopDB.Close(),
 	)
+
+	// If the staker being added is a validator, add it to the current validators index
+	if priority > 0 {
+		prefixCurrentValidators := []byte(fmt.Sprintf("%s%s", subnetID, currentValidatorsPrefix))
+		currentValidatorsDB := prefixdb.NewNested(prefixCurrentValidators, db)
+
+		errs.Add(
+			currentValidatorsDB.Put(nodeID.Bytes(), txBytes),
+			currentValidatorsDB.Close(),
+		)
+	}
+
 	return errs.Err
 }
 
@@ -221,6 +254,7 @@ func (vm *VM) removeStaker(db database.Database, subnetID ids.ID, tx *rewardTx) 
 	var (
 		staker   TimedTx
 		priority byte
+		nodeID   ids.ShortID
 	)
 	switch unsignedTx := tx.Tx.UnsignedTx.(type) {
 	case *UnsignedAddDelegatorTx:
@@ -229,9 +263,11 @@ func (vm *VM) removeStaker(db database.Database, subnetID ids.ID, tx *rewardTx) 
 	case *UnsignedAddSubnetValidatorTx:
 		staker = unsignedTx
 		priority = 1
+		nodeID = unsignedTx.Validator.NodeID
 	case *UnsignedAddValidatorTx:
 		staker = unsignedTx
 		priority = 2
+		nodeID = unsignedTx.Validator.NodeID
 	default:
 		return fmt.Errorf("staker is unexpected type %T", tx.Tx.UnsignedTx)
 	}
@@ -242,23 +278,31 @@ func (vm *VM) removeStaker(db database.Database, subnetID ids.ID, tx *rewardTx) 
 	prefixStop := []byte(fmt.Sprintf("%s%s", subnetID, stopDBPrefix))
 	prefixStopDB := prefixdb.NewNested(prefixStop, db)
 
-	p := wrappers.Packer{MaxSize: wrappers.LongLen + wrappers.ByteLen + hashing.HashLen}
-	p.PackLong(uint64(staker.EndTime().Unix()))
-	p.PackByte(priority)
-	p.PackFixedBytes(txID[:])
-	if p.Err != nil {
+	stopKey, err := timedTxKey(staker.EndTime(), priority, txID)
+	if err != nil {
 		// Close the DB, but ignore the error, as the parent error needs to be
 		// returned.
 		_ = prefixStopDB.Close()
-		return fmt.Errorf("couldn't serialize validator key: %w", p.Err)
+		return fmt.Errorf("couldn't serialize validator key: %w", err)
 	}
-	stopKey := p.Bytes
 
 	errs := wrappers.Errs{}
 	errs.Add(
 		prefixStopDB.Delete(stopKey),
 		prefixStopDB.Close(),
 	)
+
+	// If the staker being removed is a validator, remove it from the current validators index
+	if priority > 0 {
+		prefixCurrentValidators := []byte(fmt.Sprintf("%s%s", subnetID, currentValidatorsPrefix))
+		currentValidatorsDB := prefixdb.NewNested(prefixCurrentValidators, db)
+
+		errs.Add(
+			currentValidatorsDB.Delete(nodeID.Bytes()),
+			currentValidatorsDB.Close(),
+		)
+	}
+
 	return errs.Err
 }
 
@@ -300,67 +344,48 @@ func (vm *VM) nextStakerStop(db database.Database, subnetID ids.ID) (*rewardTx, 
 
 // Returns true if [nodeID] is a validator (not a delegator) of subnet [subnetID]
 func (vm *VM) isValidator(db database.Database, subnetID ids.ID, nodeID ids.ShortID) (TimedTx, bool, error) {
-	iter := prefixdb.NewNested([]byte(fmt.Sprintf("%s%s", subnetID, stopDBPrefix)), db).NewIterator()
-	defer iter.Release()
+	prefixCurrentValidators := []byte(fmt.Sprintf("%s%s", subnetID, currentValidatorsPrefix))
+	currentValidatorsDB := prefixdb.NewNested(prefixCurrentValidators, db)
+	defer currentValidatorsDB.Close()
 
-	for iter.Next() {
-		txBytes := iter.Value()
-		tx := rewardTx{}
-		if _, err := Codec.Unmarshal(txBytes, &tx); err != nil {
-			return nil, false, err
-		}
-
-		switch vdr := tx.Tx.UnsignedTx.(type) {
-		case *UnsignedAddValidatorTx:
-			if subnetID == constants.PrimaryNetworkID && vdr.Validator.NodeID == nodeID {
-				if err := tx.Tx.Sign(vm.codec, nil); err != nil {
-					return nil, false, err
-				}
-				return vdr, true, nil
-			}
-		case *UnsignedAddSubnetValidatorTx:
-			if subnetID == vdr.Validator.SubnetID() && vdr.Validator.NodeID == nodeID {
-				if err := tx.Tx.Sign(vm.codec, nil); err != nil {
-					return nil, false, err
-				}
-				return vdr, true, nil
-			}
-		}
+	txBytes, err := currentValidatorsDB.Get(nodeID.Bytes())
+	if err != nil {
+		return nil, false, nil
 	}
-	return nil, false, nil
+
+	tx := rewardTx{}
+	if _, err := Codec.Unmarshal(txBytes, &tx); err != nil {
+		return nil, false, err
+	}
+
+	if err := tx.Tx.Sign(vm.codec, nil); err != nil {
+		return nil, false, err
+	}
+	return tx.Tx.UnsignedTx.(TimedTx), true, nil
 }
 
 // Returns true if [nodeID] will be a validator (not a delegator) of subnet
 // [subnetID]
 func (vm *VM) willBeValidator(db database.Database, subnetID ids.ID, nodeID ids.ShortID) (TimedTx, bool, error) {
-	iter := prefixdb.NewNested([]byte(fmt.Sprintf("%s%s", subnetID, startDBPrefix)), db).NewIterator()
-	defer iter.Release()
+	prefixPendingValidators := []byte(fmt.Sprintf("%s%s", subnetID, pendingValidatorsPrefix))
+	pendingValidatorsDB := prefixdb.NewNested(prefixPendingValidators, db)
+	defer pendingValidatorsDB.Close()
 
-	for iter.Next() {
-		txBytes := iter.Value()
-		tx := Tx{}
-		if _, err := Codec.Unmarshal(txBytes, &tx); err != nil {
-			return nil, false, err
-		}
-
-		switch vdr := tx.UnsignedTx.(type) {
-		case *UnsignedAddValidatorTx:
-			if subnetID == constants.PrimaryNetworkID && vdr.Validator.NodeID == nodeID {
-				if err := tx.Sign(vm.codec, nil); err != nil {
-					return nil, false, err
-				}
-				return vdr, true, nil
-			}
-		case *UnsignedAddSubnetValidatorTx:
-			if subnetID == vdr.Validator.SubnetID() && vdr.Validator.NodeID == nodeID {
-				if err := tx.Sign(vm.codec, nil); err != nil {
-					return nil, false, err
-				}
-				return vdr, true, nil
-			}
-		}
+	txBytes, err := pendingValidatorsDB.Get(nodeID.Bytes())
+	if err != nil {
+		return nil, false, nil
 	}
-	return nil, false, nil
+
+	tx := Tx{}
+	if _, err := Codec.Unmarshal(txBytes, &tx); err != nil {
+		return nil, false, err
+	}
+
+	if err := tx.Sign(vm.codec, nil); err != nil {
+		return nil, false, err
+	}
+
+	return tx.UnsignedTx.(TimedTx), true, nil
 }
 
 // getUTXO returns the UTXO with the specified ID
@@ -930,4 +955,16 @@ func (vm *VM) unmarshalBlockFunc(bytes []byte) (snowman.Block, error) {
 	}
 	// Populate the un-serialized fields of the block
 	return block, block.initialize(vm, bytes)
+}
+
+// timedTxKey constructs the key to use for [txID] in stop and start prefix DBs
+func timedTxKey(time time.Time, priority byte, txID ids.ID) ([]byte, error) {
+	p := wrappers.Packer{MaxSize: wrappers.LongLen + wrappers.ByteLen + hashing.HashLen}
+	p.PackLong(uint64(time.Unix()))
+	p.PackByte(priority)
+	p.PackFixedBytes(txID[:])
+	if p.Err != nil {
+		return nil, fmt.Errorf("couldn't serialize validator key: %w", p.Err)
+	}
+	return p.Bytes, nil
 }
